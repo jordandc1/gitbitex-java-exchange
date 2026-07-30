@@ -5,11 +5,16 @@ import com.gitbitex.enums.OrderStatus;
 import com.gitbitex.enums.OrderType;
 import com.gitbitex.matchingengine.command.PlaceOrderCommand;
 import com.gitbitex.matchingengine.command.PutProductCommand;
+import com.gitbitex.matchingengine.message.AccountMessage;
+import com.gitbitex.matchingengine.message.Message;
+import com.gitbitex.matchingengine.message.TradeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.math.BigDecimal;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -40,6 +45,12 @@ class OrderBookTest {
                 messageSender,
                 messageSequence
         );
+        //add product BTC-USDT
+        putProductCommand = new PutProductCommand();
+        putProductCommand.setProductId("BTC-USDT");
+        putProductCommand.setBaseCurrency("BTC");
+        putProductCommand.setQuoteCurrency("USDT");
+        productBook.addProduct(new Product(putProductCommand));
     }
 
     @Test
@@ -179,7 +190,7 @@ class OrderBookTest {
         putProductCommand.setBaseCurrency("BTC");
         putProductCommand.setQuoteCurrency("USDT");
         productBook.addProduct(new Product(putProductCommand));
-        
+
         //Seller A places 1 BTC @ 110 USDT.
         Account sellerABTCAccount = new Account();
         sellerABTCAccount.setId("1");
@@ -282,4 +293,244 @@ class OrderBookTest {
                         .getHold()).add(sellerBUSDTAccount.getAvailable()));
     }
 
+    @Test
+    void crossingLimitBuyHonorsPriceTimePriorityAndSettlesAccounts() {
+        // worse-maker: sell 2 BTC at 105 USDT
+        Account worseMakerBTC = new Account();
+        worseMakerBTC.setId("1");
+        worseMakerBTC.setUserId("worseMaker");
+        worseMakerBTC.setCurrency("BTC");
+        worseMakerBTC.setAvailable(BigDecimal.valueOf(2));
+        worseMakerBTC.setHold(BigDecimal.ZERO);
+        Account worseMakerUSDT = new Account();
+        worseMakerUSDT.setId("2");
+        worseMakerUSDT.setUserId("worseMaker");
+        worseMakerUSDT.setCurrency("USDT");
+        worseMakerUSDT.setAvailable(BigDecimal.ZERO);
+        worseMakerUSDT.setHold(BigDecimal.ZERO);
+        accountBook.add(worseMakerBTC);
+        accountBook.add(worseMakerUSDT);
+        PlaceOrderCommand worseMakerCommand = new PlaceOrderCommand();
+        worseMakerCommand.setProductId("BTC-USDT");
+        worseMakerCommand.setOrderId("1");
+        worseMakerCommand.setUserId("worseMaker");
+        worseMakerCommand.setSize(BigDecimal.valueOf(2));
+        worseMakerCommand.setPrice(BigDecimal.valueOf(105));
+        worseMakerCommand.setOrderType(OrderType.LIMIT);
+        worseMakerCommand.setOrderSide(OrderSide.SELL);
+        worseMakerCommand.setTime(new Date(0));
+        Order worseMakerOrder = new Order(worseMakerCommand);
+        orderBook.placeOrder(worseMakerOrder);
+        assertBalance(worseMakerBTC, 0, 2);
+
+        // best-old: sell 2 BTC at 100 USDT.
+        Account bestOldBTC = new Account();
+        bestOldBTC.setId("3");
+        bestOldBTC.setUserId("bestOld");
+        bestOldBTC.setCurrency("BTC");
+        bestOldBTC.setAvailable(BigDecimal.valueOf(2));
+        bestOldBTC.setHold(BigDecimal.ZERO);
+        Account bestOldUSDT = new Account();
+        bestOldUSDT.setId("4");
+        bestOldUSDT.setUserId("bestOld");
+        bestOldUSDT.setCurrency("USDT");
+        bestOldUSDT.setAvailable(BigDecimal.ZERO);
+        bestOldUSDT.setHold(BigDecimal.ZERO);
+        accountBook.add(bestOldBTC);
+        accountBook.add(bestOldUSDT);
+        PlaceOrderCommand bestOldCommand = new PlaceOrderCommand();
+        bestOldCommand.setProductId("BTC-USDT");
+        bestOldCommand.setOrderId("2");
+        bestOldCommand.setUserId("bestOld");
+        bestOldCommand.setSize(BigDecimal.valueOf(2));
+        bestOldCommand.setPrice(BigDecimal.valueOf(100));
+        bestOldCommand.setOrderType(OrderType.LIMIT);
+        bestOldCommand.setOrderSide(OrderSide.SELL);
+        bestOldCommand.setTime(new Date(0));
+        Order bestOldOrder = new Order(bestOldCommand);
+        orderBook.placeOrder(bestOldOrder);
+        assertBalance(bestOldBTC, 0, 2);
+
+        // best-new: sell 2 BTC at 100 USDT.
+        Account bestNewBTC = new Account();
+        bestNewBTC.setId("5");
+        bestNewBTC.setUserId("bestNew");
+        bestNewBTC.setCurrency("BTC");
+        bestNewBTC.setAvailable(BigDecimal.valueOf(2));
+        bestNewBTC.setHold(BigDecimal.ZERO);
+        Account bestNewUSDT = new Account();
+        bestNewUSDT.setId("6");
+        bestNewUSDT.setUserId("bestNew");
+        bestNewUSDT.setCurrency("USDT");
+        bestNewUSDT.setAvailable(BigDecimal.ZERO);
+        bestNewUSDT.setHold(BigDecimal.ZERO);
+        accountBook.add(bestNewBTC);
+        accountBook.add(bestNewUSDT);
+        PlaceOrderCommand bestNewCommand = new PlaceOrderCommand();
+        bestNewCommand.setProductId("BTC-USDT");
+        bestNewCommand.setOrderId("3");
+        bestNewCommand.setUserId("bestNew");
+        bestNewCommand.setSize(BigDecimal.valueOf(2));
+        bestNewCommand.setPrice(BigDecimal.valueOf(100));
+        bestNewCommand.setOrderType(OrderType.LIMIT);
+        bestNewCommand.setOrderSide(OrderSide.SELL);
+        bestNewCommand.setTime(new Date(0));
+        Order bestNewOrder = new Order(bestNewCommand);
+        orderBook.placeOrder(bestNewOrder);
+        assertBalance(bestNewBTC, 0, 2);
+
+        // buyer: buy 3 BTC with a limit of 110 USDT and an initial 400 USDT balance.
+        Account buyerBTC = new Account();
+        buyerBTC.setId("7");
+        buyerBTC.setUserId("buyer");
+        buyerBTC.setCurrency("BTC");
+        buyerBTC.setAvailable(BigDecimal.ZERO);
+        buyerBTC.setHold(BigDecimal.ZERO);
+        Account buyerUSDT = new Account();
+        buyerUSDT.setId("8");
+        buyerUSDT.setUserId("buyer");
+        buyerUSDT.setCurrency("USDT");
+        buyerUSDT.setAvailable(BigDecimal.valueOf(400));
+        buyerUSDT.setHold(BigDecimal.ZERO);
+        accountBook.add(buyerBTC);
+        accountBook.add(buyerUSDT);
+        PlaceOrderCommand buyerCommand = new PlaceOrderCommand();
+        buyerCommand.setProductId("BTC-USDT");
+        buyerCommand.setOrderId("4");
+        buyerCommand.setUserId("buyer");
+        buyerCommand.setSize(BigDecimal.valueOf(3));
+        buyerCommand.setPrice(BigDecimal.valueOf(110));
+        buyerCommand.setOrderType(OrderType.LIMIT);
+        buyerCommand.setOrderSide(OrderSide.BUY);
+        buyerCommand.setTime(new Date(0));
+        Order buyerOrder = new Order(buyerCommand);
+        orderBook.placeOrder(buyerOrder);
+
+        ArgumentCaptor<Message> messageCaptor =
+                ArgumentCaptor.forClass(Message.class);
+
+        verify(messageSender, atLeastOnce())
+                .send(messageCaptor.capture());
+
+        List<Message> messages = messageCaptor.getAllValues();
+
+        List<Trade> trades = messages.stream()
+                .filter(TradeMessage.class::isInstance)
+                .map(TradeMessage.class::cast)
+                .map(TradeMessage::getTrade)
+                .toList();
+
+        assertEquals(2, trades.size());
+
+        Trade firstTrade = trades.get(0);
+        assertEquals("2", firstTrade.getMakerOrderId());
+        assertEquals("4", firstTrade.getTakerOrderId());
+        assertEquals(BigDecimal.valueOf(2), firstTrade.getSize());
+        assertEquals(BigDecimal.valueOf(100), firstTrade.getPrice());
+        assertEquals(BigDecimal.valueOf(200), firstTrade.getFunds());
+
+        Trade secondTrade = trades.get(1);
+        assertEquals("3", secondTrade.getMakerOrderId());
+        assertEquals("4", secondTrade.getTakerOrderId());
+        assertEquals(BigDecimal.ONE, secondTrade.getSize());
+        assertEquals(BigDecimal.valueOf(100), secondTrade.getPrice());
+        assertEquals(BigDecimal.valueOf(100), secondTrade.getFunds());
+
+        List<Account> buyerUsdtSnapshots = messages.stream()
+                .filter(AccountMessage.class::isInstance)
+                .map(AccountMessage.class::cast)
+                .map(AccountMessage::getAccount)
+                .filter(account -> "buyer".equals(account.getUserId()))
+                .filter(account -> "USDT".equals(account.getCurrency()))
+                .toList();
+
+        assertEquals(4, buyerUsdtSnapshots.size());
+
+        assertBalance(buyerUsdtSnapshots.get(0), 70, 330);
+        assertBalance(buyerUsdtSnapshots.get(1), 70, 130);
+        assertBalance(buyerUsdtSnapshots.get(2), 70, 30);
+        assertBalance(buyerUsdtSnapshots.get(3), 100, 0);
+
+        assertTrue(orderBook.getBids().isEmpty());
+
+        assertEquals(2, orderBook.getAsks().size());
+
+        // Best-price level: only the partially filled bestNew order remains.
+        PriceGroupedOrderCollection bestAskLevel =
+                orderBook.getAsks().get(BigDecimal.valueOf(100));
+
+        assertNotNull(bestAskLevel);
+        assertEquals(1, bestAskLevel.size());
+        assertSame(bestNewOrder, bestAskLevel.get("3"));
+        assertEquals(
+                0,
+                BigDecimal.ONE.compareTo(bestNewOrder.getRemainingSize())
+        );
+        assertFalse(bestAskLevel.containsKey("2"));
+
+        // Worse-price level remains completely untouched.
+        PriceGroupedOrderCollection worseAskLevel =
+                orderBook.getAsks().get(BigDecimal.valueOf(105));
+
+        assertNotNull(worseAskLevel);
+        assertEquals(1, worseAskLevel.size());
+        assertSame(worseMakerOrder, worseAskLevel.get("1"));
+        assertEquals(
+                0,
+                BigDecimal.valueOf(2)
+                        .compareTo(worseMakerOrder.getRemainingSize())
+        );
+
+        // Filled orders must not remain in the order-ID index.
+        assertFalse(orderBook.getOrderById().containsKey("2"));
+        assertFalse(orderBook.getOrderById().containsKey("4"));
+
+        // Open orders must remain indexed.
+        assertSame(bestNewOrder, orderBook.getOrderById().get("3"));
+        assertSame(worseMakerOrder, orderBook.getOrderById().get("1"));
+
+        assertEquals(OrderStatus.FILLED, buyerOrder.getStatus());
+        assertEquals(OrderStatus.FILLED, bestOldOrder.getStatus());
+        assertEquals(OrderStatus.OPEN, bestNewOrder.getStatus());
+        assertEquals(OrderStatus.OPEN, worseMakerOrder.getStatus());
+
+        assertEquals(buyerBTC.getAvailable(), BigDecimal.valueOf(3));
+        assertEquals(buyerBTC.getHold(), BigDecimal.valueOf(0));
+        assertEquals(buyerUSDT.getAvailable(), BigDecimal.valueOf(100));
+        assertEquals(buyerUSDT.getHold(), BigDecimal.valueOf(0));
+
+        assertEquals(bestOldBTC.getAvailable(), BigDecimal.valueOf(0));
+        assertEquals(bestOldBTC.getHold(), BigDecimal.valueOf(0));
+        assertEquals(bestOldUSDT.getAvailable(), BigDecimal.valueOf(200));
+        assertEquals(bestOldUSDT.getHold(), BigDecimal.valueOf(0));
+
+        assertEquals(bestNewBTC.getAvailable(), BigDecimal.valueOf(0));
+        assertEquals(bestNewBTC.getHold(), BigDecimal.valueOf(1));
+        assertEquals(bestNewUSDT.getAvailable(), BigDecimal.valueOf(100));
+        assertEquals(bestNewUSDT.getHold(), BigDecimal.valueOf(0));
+
+        assertEquals(worseMakerBTC.getAvailable(), BigDecimal.valueOf(0));
+        assertEquals(worseMakerBTC.getHold(), BigDecimal.valueOf(2));
+        assertEquals(worseMakerUSDT.getAvailable(), BigDecimal.valueOf(0));
+        assertEquals(worseMakerUSDT.getHold(), BigDecimal.valueOf(0));
+
+        assertTrue(bestOldOrder.getSequence() < bestNewOrder.getSequence());
+    }
+
+    private static void assertBalance(
+            Account account,
+            long expectedAvailable,
+            long expectedHold
+    ) {
+        assertEquals(
+                0,
+                BigDecimal.valueOf(expectedAvailable)
+                        .compareTo(account.getAvailable())
+        );
+        assertEquals(
+                0,
+                BigDecimal.valueOf(expectedHold)
+                        .compareTo(account.getHold())
+        );
+    }
 }
