@@ -654,6 +654,214 @@ class OrderBookTest {
 
     }
 
+    @Test
+    void marketSellMatchesBestBidsThenCancelsRemainderAndReleasesBaseHold() {
+        // low-bid rests a limit buy for 1 BTC at 100.
+        Account lowBidBTC = createAccount("1","user-1", "BTC", BigDecimal.ZERO, BigDecimal.ZERO);
+        Account lowBidUSDT = createAccount("2","user-1", "USDT", BigDecimal.valueOf(100),
+                BigDecimal.ZERO);
+        accountBook.add(lowBidBTC);
+        accountBook.add(lowBidUSDT);
+        PlaceOrderCommand lowBidOrder = createPlaceOrderCommand("BTC-USDT", "1", "user-1",
+                BigDecimal.valueOf(1), BigDecimal.valueOf(100), OrderType.LIMIT, OrderSide.BUY);
+        Order lowBid = new Order(lowBidOrder);
+        orderBook.placeOrder(lowBid);
+        // high-bid rests a limit buy for 1 BTC at 110.
+        Account highBidBTC = createAccount("3","user-2", "BTC", BigDecimal.ZERO, BigDecimal.ZERO);
+        Account highBidUSDT = createAccount("4","user-2", "USDT", BigDecimal.valueOf(110),
+                BigDecimal.ZERO);
+        accountBook.add(highBidBTC);
+        accountBook.add(highBidUSDT);
+        PlaceOrderCommand highBidOrder = createPlaceOrderCommand("BTC-USDT", "2", "user-2",
+                BigDecimal.valueOf(1), BigDecimal.valueOf(110), OrderType.LIMIT, OrderSide.BUY);
+        Order highBid = new Order(highBidOrder);
+        orderBook.placeOrder(highBid);
+        // Seller starts with 3 BTC and submits a market sell for 3 BTC.
+        Account sellerBTC = createAccount("5","user-3", "BTC", BigDecimal.valueOf(3),
+                BigDecimal.ZERO);
+        Account sellerUSDT = createAccount("6","user-3", "USDT", BigDecimal.ZERO, BigDecimal.ZERO);
+        accountBook.add(sellerBTC);
+        accountBook.add(sellerUSDT);
+        // Use price=0 and funds=0 for the market sell, matching the API formatting path.
+        PlaceOrderCommand sellOrder = createPlaceOrderCommand("BTC-USDT", "3", "user-3",
+                BigDecimal.valueOf(3), BigDecimal.ZERO, OrderType.MARKET, OrderSide.SELL);
+        Order marketSell = new Order(sellOrder);
+        orderBook.placeOrder(marketSell);
+        // Expected trades:
+        // high-bid: 1 BTC at 110.
+        // low-bid: 1 BTC at 100.
+        // Only 2 BTC of liquidity exists, so the remaining 1 BTC cannot execute.
+        // Capture and verify the seller-BTC account transition above.
+        ArgumentCaptor<Message> messageCaptor =
+                ArgumentCaptor.forClass(Message.class);
+
+        verify(messageSender, atLeastOnce())
+                .send(messageCaptor.capture());
+
+        List<Message> messages = messageCaptor.getAllValues();
+
+        List<Trade> trades = messages.stream()
+                .filter(TradeMessage.class::isInstance)
+                .map(TradeMessage.class::cast)
+                .map(TradeMessage::getTrade)
+                .toList();
+
+        assertEquals(2, trades.size());
+
+        Trade highBidTrade = trades.get(0);
+        assertEquals("2", highBidTrade.getMakerOrderId());
+        assertEquals("3", highBidTrade.getTakerOrderId());
+        assertEquals(BigDecimal.valueOf(1), highBidTrade.getSize());
+        assertEquals(BigDecimal.valueOf(110), highBidTrade.getPrice());
+        assertEquals(BigDecimal.valueOf(110), highBidTrade.getFunds());
+
+        Trade lowBidTrade = trades.get(1);
+        assertEquals("1", lowBidTrade.getMakerOrderId());
+        assertEquals("3", lowBidTrade.getTakerOrderId());
+        assertEquals(BigDecimal.valueOf(1), lowBidTrade.getSize());
+        assertEquals(BigDecimal.valueOf(100), lowBidTrade.getPrice());
+        assertEquals(BigDecimal.valueOf(100), lowBidTrade.getFunds());
+
+        // Capture and verify the seller-BTC account transition above.
+        List<AccountMessage> sellerBtcMessages = messages.stream()
+                .filter(AccountMessage.class::isInstance)
+                .map(AccountMessage.class::cast)
+                .filter(message ->
+                        "user-3".equals(message.getAccount().getUserId()))
+                .filter(message ->
+                        "BTC".equals(message.getAccount().getCurrency()))
+                .toList();
+
+        assertEquals(4, sellerBtcMessages.size());
+
+        assertBalance(sellerBtcMessages.get(0).getAccount(), 0, 3);
+        assertBalance(sellerBtcMessages.get(1).getAccount(), 0, 2);
+        assertBalance(sellerBtcMessages.get(2).getAccount(), 0, 1);
+        assertBalance(sellerBtcMessages.get(3).getAccount(), 1, 0);
+
+        assertEquals(OrderStatus.FILLED, highBid.getStatus());
+        assertEquals(OrderStatus.FILLED, lowBid.getStatus());
+        assertEquals(OrderStatus.CANCELLED, marketSell.getStatus());
+        assertEquals(
+                0,
+                BigDecimal.ONE.compareTo(marketSell.getRemainingSize())
+        );
+
+        assertTrue(orderBook.getBids().isEmpty());
+        assertTrue(orderBook.getAsks().isEmpty());
+        assertTrue(orderBook.getOrderById().isEmpty());
+
+        assertBalance(sellerBTC, 1, 0);
+        assertBalance(sellerUSDT, 210, 0);
+        assertBalance(highBidBTC, 1, 0);
+        assertBalance(highBidUSDT, 0, 0);
+        assertBalance(lowBidBTC, 1, 0);
+        assertBalance(lowBidUSDT, 0, 0);
+
+        BigDecimal totalBTC = sellerBTC.getAvailable()
+                .add(sellerBTC.getHold())
+                .add(highBidBTC.getAvailable())
+                .add(highBidBTC.getHold())
+                .add(lowBidBTC.getAvailable())
+                .add(lowBidBTC.getHold());
+
+        BigDecimal totalUSDT = sellerUSDT.getAvailable()
+                .add(sellerUSDT.getHold())
+                .add(highBidUSDT.getAvailable())
+                .add(highBidUSDT.getHold())
+                .add(lowBidUSDT.getAvailable())
+                .add(lowBidUSDT.getHold());
+
+        assertEquals(0, BigDecimal.valueOf(3).compareTo(totalBTC));
+        assertEquals(0, BigDecimal.valueOf(210).compareTo(totalUSDT));
+    }
+
+    @Test
+    void insufficientFundsLimitOrdersAreRejectedWithoutSideEffects() {
+        // Submit two orders:
+        // Buyer has 99 USDT and submits a limit buy for 1 BTC at 100.
+        Account buyerBTCAccount = createAccount("1", "buyer", "BTC", BigDecimal.ZERO, BigDecimal.ZERO);
+        Account buyerUSDTAccount = createAccount("2", "buyer", "USDT",
+                BigDecimal.valueOf(99), BigDecimal.ZERO);
+        accountBook.add(buyerBTCAccount);
+        accountBook.add(buyerUSDTAccount);
+        PlaceOrderCommand buyCommand = createPlaceOrderCommand("BTC-USDT", "buy-1", "buyer",
+                BigDecimal.valueOf(1), BigDecimal.valueOf(100), OrderType.LIMIT, OrderSide.BUY);
+        Order buyOrder = new Order(buyCommand);
+        orderBook.placeOrder(buyOrder);
+        assertEquals(OrderStatus.REJECTED, buyOrder.getStatus());
+        assertBalance(buyerBTCAccount, 0, 0);
+        assertBalance(buyerUSDTAccount, 99, 0);
+        // Seller has 1 BTC and submits a limit sell for 2 BTC at 100.
+        Account sellerBTCAccount = createAccount("3", "seller", "BTC", BigDecimal.valueOf(1), BigDecimal.ZERO);
+        Account sellerUSDTAccount = createAccount("4", "seller", "USDT",
+                BigDecimal.ZERO, BigDecimal.ZERO);
+        accountBook.add(sellerBTCAccount);
+        accountBook.add(sellerUSDTAccount);
+        PlaceOrderCommand sellCommand = createPlaceOrderCommand("BTC-USDT", "sell- 1", "seller", BigDecimal.valueOf(2), BigDecimal.valueOf(100), OrderType.LIMIT, OrderSide.SELL);
+        Order sellOrder = new Order(sellCommand);
+        orderBook.placeOrder(sellOrder);
+        assertEquals(OrderStatus.REJECTED, sellOrder.getStatus());
+        assertBalance(sellerBTCAccount, 1, 0);
+        assertBalance(sellerUSDTAccount, 0, 0);
+        // Seed both BTC and USDT accounts for each user.
+        // Capture exactly two OrderMessage events in submission order.
+        ArgumentCaptor<Message> messageCaptor =
+                ArgumentCaptor.forClass(Message.class);
+        verify(messageSender, times(2))
+                .send(messageCaptor.capture());
+        List<Message> messages = messageCaptor.getAllValues();
+
+        List<OrderMessage> orderMessages = messages.stream()
+                .filter(OrderMessage.class::isInstance)
+                .map(OrderMessage.class::cast)
+                .toList();
+        assertEquals(2, orderMessages.size());
+        assertEquals(buyOrder.getId(), orderMessages.get(0).getOrder().getId());
+        assertEquals(sellOrder.getId(), orderMessages.get(1).getOrder().getId());
+        // Both snapshots have status REJECTED.
+        assertEquals(OrderStatus.REJECTED, orderMessages.get(0).getOrder().getStatus());
+        assertEquals(OrderStatus.REJECTED, orderMessages.get(1).getOrder().getStatus());
+        // Snapshot order IDs match the rejected buy and sell.
+        assertEquals(buyOrder.getId(), orderMessages.get(0).getOrder().getId());
+        assertEquals(sellOrder.getId(), orderMessages.get(1).getOrder().getId());
+        // Snapshots are not the same object instances as the live orders.
+        assertNotSame(buyOrder, orderMessages.get(0).getOrder());
+        assertNotSame(sellOrder, orderMessages.get(1).getOrder());
+        // Capture zero TradeMessage and zero AccountMessage events.
+        List<TradeMessage> tradeMessages = messages.stream()
+                .filter(TradeMessage.class::isInstance)
+                .map(TradeMessage.class::cast)
+                .toList();
+        assertEquals(0, tradeMessages.size());
+        List<AccountMessage> accountMessages = messages.stream()
+                .filter(AccountMessage.class::isInstance)
+                .map(AccountMessage.class::cast)
+                .toList();
+        assertEquals(0, accountMessages.size());
+        // Bids, asks, and orderById are empty.
+        assertTrue(orderBook.getBids().isEmpty());
+        assertTrue(orderBook.getAsks().isEmpty());
+        assertTrue(orderBook.getOrderById().isEmpty());
+        // Final balances:Buyer: BTC 0/0, USDT 99/0.
+        assertBalance(buyerBTCAccount, 0, 0);
+        assertBalance(buyerUSDTAccount, 99, 0);
+        // Seller: BTC 1/0, USDT 0/0.
+        assertBalance(sellerBTCAccount, 1, 0);
+        assertBalance(sellerUSDTAccount, 0, 0);
+        // Total BTC: 1, Total USDT: 99.
+        BigDecimal totalBTC = buyerBTCAccount.getAvailable()
+                .add(buyerBTCAccount.getHold())
+                .add(sellerBTCAccount.getAvailable())
+                .add(sellerBTCAccount.getHold());
+        BigDecimal totalUSDT = buyerUSDTAccount.getAvailable()
+                .add(buyerUSDTAccount.getHold())
+                .add(sellerUSDTAccount.getAvailable())
+                .add(sellerUSDTAccount.getHold());
+        assertEquals(0, BigDecimal.valueOf(1).compareTo(totalBTC));
+        assertEquals(0, BigDecimal.valueOf(99).compareTo(totalUSDT));
+    }
+
     private static void assertBalance(
             Account account,
             long expectedAvailable,
