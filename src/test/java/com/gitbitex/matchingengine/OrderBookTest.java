@@ -7,6 +7,7 @@ import com.gitbitex.matchingengine.command.PlaceOrderCommand;
 import com.gitbitex.matchingengine.command.PutProductCommand;
 import com.gitbitex.matchingengine.message.AccountMessage;
 import com.gitbitex.matchingengine.message.Message;
+import com.gitbitex.matchingengine.message.OrderMessage;
 import com.gitbitex.matchingengine.message.TradeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -175,9 +176,9 @@ class OrderBookTest {
         assertEquals(BigDecimal.ZERO, sellerBTCAccount.getHold());
         assertEquals(BigDecimal.ZERO, sellerUSDTAccount.getHold());
         assertEquals(sellerUSDTAccount.getAvailable(), BigDecimal.valueOf(200));
-        assertEquals(BigDecimal.valueOf(2),buyerBTCAccount.getAvailable().add(buyerBTCAccount.getHold())
+        assertEquals(BigDecimal.valueOf(2), buyerBTCAccount.getAvailable().add(buyerBTCAccount.getHold())
                 .add(sellerBTCAccount.getAvailable()).add(sellerBTCAccount.getHold()));
-        assertEquals(BigDecimal.valueOf(220),buyerUSDTAccount.getAvailable().add(buyerUSDTAccount.getHold())
+        assertEquals(BigDecimal.valueOf(220), buyerUSDTAccount.getAvailable().add(buyerUSDTAccount.getHold())
                 .add(sellerUSDTAccount.getAvailable()).add(sellerUSDTAccount.getHold()));
 
     }
@@ -285,10 +286,10 @@ class OrderBookTest {
         assertEquals(BigDecimal.ZERO, buyerUSDTAccount.getHold());
         assertEquals(sellerABTCAccount.getHold(), BigDecimal.valueOf(1));
         assertEquals(sellerBUSDTAccount.getAvailable(), BigDecimal.valueOf(100));
-        assertEquals(BigDecimal.valueOf(2),buyerBTCAccount.getAvailable().add(buyerBTCAccount.getHold())
+        assertEquals(BigDecimal.valueOf(2), buyerBTCAccount.getAvailable().add(buyerBTCAccount.getHold())
                 .add(sellerABTCAccount.getAvailable()).add(sellerABTCAccount.getHold()).add(sellerBBTCAccount.getHold())
                 .add(sellerBBTCAccount.getAvailable()));
-        assertEquals(BigDecimal.valueOf(110),buyerUSDTAccount.getAvailable().add(buyerUSDTAccount.getHold())
+        assertEquals(BigDecimal.valueOf(110), buyerUSDTAccount.getAvailable().add(buyerUSDTAccount.getHold())
                 .add(sellerAUSDTAccount.getAvailable()).add(sellerAUSDTAccount.getHold()).add(sellerBUSDTAccount
                         .getHold()).add(sellerBUSDTAccount.getAvailable()));
     }
@@ -517,6 +518,142 @@ class OrderBookTest {
         assertTrue(bestOldOrder.getSequence() < bestNewOrder.getSequence());
     }
 
+    @Test
+    void cancelPartiallyFilledLimitBuyReleasesOnlyRemainingQuoteHold() {
+        // Buyer starts with 500 USDT and 0 BTC.
+        Account buyerBTC = createAccount("1", "buyer", "BTC", BigDecimal.ZERO, BigDecimal.ZERO);
+        Account buyerUSDT = createAccount("2", "buyer", "USDT", BigDecimal.valueOf(500),
+                BigDecimal.ZERO);
+        accountBook.add(buyerBTC);
+        accountBook.add(buyerUSDT);
+        // Buyer rests a limit buy for 5 BTC at 100:USDT becomes available=0, hold=500.
+        PlaceOrderCommand buyerCommand = createPlaceOrderCommand("BTC-USDT", "1", "buyer",
+                BigDecimal.valueOf(5), BigDecimal.valueOf(100), OrderType.LIMIT, OrderSide.BUY);
+        Order buyerOrder = new Order(buyerCommand);
+        orderBook.placeOrder(buyerOrder);
+        // Seller starts with 2 BTC and submits a crossing limit sell for 2 BTC at 90.
+        Account sellerBTC = createAccount("3", "seller", "BTC", BigDecimal.valueOf(2), BigDecimal.ZERO);
+        Account sellerUSDT = createAccount("4", "seller", "USDT", BigDecimal.ZERO,
+                BigDecimal.ZERO);
+        accountBook.add(sellerBTC);
+        accountBook.add(sellerUSDT);
+        PlaceOrderCommand sellerCommand = createPlaceOrderCommand("BTC-USDT", "2", "seller",
+                BigDecimal.valueOf(2), BigDecimal.valueOf(90), OrderType.LIMIT, OrderSide.SELL);
+        Order sellOrder = new Order(sellerCommand);
+        orderBook.placeOrder(sellOrder);
+
+        // Trade executes at the resting maker price of 100.
+        ArgumentCaptor<Message> messageCaptor =
+                ArgumentCaptor.forClass(Message.class);
+
+        verify(messageSender, atLeastOnce())
+                .send(messageCaptor.capture());
+
+        List<Message> messages = messageCaptor.getAllValues();
+
+        List<Trade> trades = messages.stream()
+                .filter(TradeMessage.class::isInstance)
+                .map(TradeMessage.class::cast)
+                .map(TradeMessage::getTrade)
+                .toList();
+
+        assertEquals(1, trades.size());
+
+        Trade firstTrade = trades.get(0);
+        assertEquals("1", firstTrade.getMakerOrderId());
+        assertEquals("2", firstTrade.getTakerOrderId());
+        assertEquals(BigDecimal.valueOf(2), firstTrade.getSize());
+        assertEquals(BigDecimal.valueOf(100), firstTrade.getPrice());
+        assertEquals(BigDecimal.valueOf(200), firstTrade.getFunds());
+
+        assertEquals(OrderStatus.OPEN, buyerOrder.getStatus());
+        assertEquals(
+                0,
+                BigDecimal.valueOf(3)
+                        .compareTo(buyerOrder.getRemainingSize())
+        );
+        assertEquals(
+                0,
+                BigDecimal.valueOf(300)
+                        .compareTo(buyerOrder.getRemainingFunds())
+        );
+        assertSame(
+                buyerOrder,
+                orderBook.getBids()
+                        .get(BigDecimal.valueOf(100))
+                        .get("1")
+        );
+        assertBalance(buyerUSDT, 0, 300);
+
+        // Forget placement/trade invocations, while keeping the same mock.
+        clearInvocations(messageSender);
+        // Cancel the buyer’s remaining open order.
+        orderBook.cancelOrder(buyerOrder.getId());
+
+        assertEquals(OrderStatus.CANCELLED, buyerOrder.getStatus());
+        assertEquals(OrderStatus.FILLED, sellOrder.getStatus());
+
+        assertTrue(orderBook.getBids().isEmpty());
+        assertFalse(orderBook.getOrderById().containsKey(buyerOrder.getId()));
+
+        assertBalance(buyerBTC, 2, 0);
+        assertBalance(buyerUSDT, 300, 0);
+        assertBalance(sellerBTC, 0, 0);
+        assertBalance(sellerUSDT, 200, 0);
+
+        ArgumentCaptor<Message> cancelCaptor =
+                ArgumentCaptor.forClass(Message.class);
+
+        verify(messageSender, times(2))
+                .send(cancelCaptor.capture());
+
+        List<Message> cancelMessages = cancelCaptor.getAllValues();
+
+        List<OrderMessage> cancellationOrderMessages = cancelMessages.stream()
+                .filter(OrderMessage.class::isInstance)
+                .map(OrderMessage.class::cast)
+                .toList();
+
+        assertEquals(1, cancellationOrderMessages.size());
+
+        Order cancelledSnapshot =
+                cancellationOrderMessages.get(0).getOrder();
+
+        assertEquals(buyerOrder.getId(), cancelledSnapshot.getId());
+        assertEquals(OrderStatus.CANCELLED, cancelledSnapshot.getStatus());
+        assertNotSame(buyerOrder, cancelledSnapshot);
+
+        List<AccountMessage> cancellationAccountMessages = cancelMessages.stream()
+                .filter(AccountMessage.class::isInstance)
+                .map(AccountMessage.class::cast)
+                .filter(message ->
+                        "buyer".equals(message.getAccount().getUserId()))
+                .filter(message ->
+                        "USDT".equals(message.getAccount().getCurrency()))
+                .toList();
+
+        assertEquals(1, cancellationAccountMessages.size());
+        assertBalance(
+                cancellationAccountMessages.get(0).getAccount(),
+                300,
+                0
+        );
+
+        BigDecimal totalBTC = buyerBTC.getAvailable()
+                .add(buyerBTC.getHold())
+                .add(sellerBTC.getAvailable())
+                .add(sellerBTC.getHold());
+
+        BigDecimal totalUSDT = buyerUSDT.getAvailable()
+                .add(buyerUSDT.getHold())
+                .add(sellerUSDT.getAvailable())
+                .add(sellerUSDT.getHold());
+
+        assertEquals(0, BigDecimal.valueOf(2).compareTo(totalBTC));
+        assertEquals(0, BigDecimal.valueOf(500).compareTo(totalUSDT));
+
+    }
+
     private static void assertBalance(
             Account account,
             long expectedAvailable,
@@ -532,5 +669,29 @@ class OrderBookTest {
                 BigDecimal.valueOf(expectedHold)
                         .compareTo(account.getHold())
         );
+    }
+
+    private Account createAccount(String id, String userId, String currency, BigDecimal available, BigDecimal hold) {
+        Account account = new Account();
+        account.setId(id);
+        account.setUserId(userId);
+        account.setCurrency(currency);
+        account.setAvailable(available);
+        account.setHold(hold);
+        return account;
+    }
+
+    private PlaceOrderCommand createPlaceOrderCommand(String productId, String orderId, String userId, BigDecimal size,
+                                                      BigDecimal price, OrderType orderType, OrderSide orderSide) {
+        PlaceOrderCommand placeOrderCommand = new PlaceOrderCommand();
+        placeOrderCommand.setProductId(productId);
+        placeOrderCommand.setOrderId(orderId);
+        placeOrderCommand.setUserId(userId);
+        placeOrderCommand.setSize(size);
+        placeOrderCommand.setPrice(price);
+        placeOrderCommand.setOrderType(orderType);
+        placeOrderCommand.setOrderSide(orderSide);
+        placeOrderCommand.setTime(new Date(0));
+        return placeOrderCommand;
     }
 }
